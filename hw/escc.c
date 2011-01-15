@@ -804,6 +804,10 @@ static void sunkbd_event(void *opaque, int ch)
     }
     KBD_DPRINTF("Translated keycode %2.2x\n", ch);
     put_queue(s, ch | release);
+    if (ch == 0x4c && release) {
+        KBD_DPRINTF("Ctrl release, now idle?\n");
+        put_queue(s, 0x7f);
+    }
 }
 
 static void handle_kbd_command(ChannelState *s, int val)
