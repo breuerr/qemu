@@ -571,6 +571,22 @@ static void tcx_init(target_phys_addr_t addr, int vram_size, int width,
     }
 }
 
+static void cg14_init(target_phys_addr_t ctrl_base,
+                      target_phys_addr_t vram_base,
+                      int width, int height)
+{
+    DeviceState *dev;
+    SysBusDevice *s;
+
+    dev = qdev_create(NULL, "cg14");
+    qdev_prop_set_uint16(dev, "width", width);
+    qdev_prop_set_uint16(dev, "height", height);
+    qdev_init_nofail(dev);
+    s = sysbus_from_qdev(dev);
+    sysbus_mmio_map(s, 0, ctrl_base);
+    sysbus_mmio_map(s, 1, vram_base);
+}
+
 /* NCR89C100/MACIO Internal ID register */
 static const uint8_t idreg_data[] = { 0xfe, 0x81, 0x01, 0x03 };
 
@@ -873,6 +889,11 @@ static void sun4m_hw_init(const struct sun4m_hwdef *hwdef, ram_addr_t RAM_size,
         exit (1);
     }
     num_vsimms = 0;
+    if (hwdef->vsimm[0].vram_base && (graphic_width > 1024 || !hwdef->tcx_base)) {
+        cg14_init(hwdef->vsimm[0].reg_base, hwdef->vsimm[0].vram_base,
+                  graphic_width, graphic_height);
+        num_vsimms++;
+    }
     if (num_vsimms == 0) {
         tcx_init(hwdef->tcx_base, 0x00100000, graphic_width, graphic_height,
                  graphic_depth);
