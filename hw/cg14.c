@@ -126,7 +126,15 @@ typedef struct CG14State {
     uint32_t vram_size;
     uint32_t vram_amask;
     uint16_t width, height;
-    int dirty, size_changed;
+    /* to optimize redraw */
+    enum {
+        UPDATE_NONE   = 0,
+        UPDATE_REDRAW = 1 << 0,
+        UPDATE_SIZE   = 1 << 1,
+        UPDATE_CLUT   = 1 << 2,
+        UPDATE_XLUT   = 1 << 3,
+        UPDATE_FULL   = 0x0f
+    } update;
 
     struct {
         uint8_t mcr;
@@ -196,19 +204,25 @@ static void cg14_update_display(void *opaque)
     uint8_t *pix;
     uint8_t *data;
     int new_width, new_height;
+    int full_update;
     cg14_draw_line_func *draw_line;
 
-    if (s->size_changed) {
+    full_update = 0;
+    if (s->update & UPDATE_SIZE) {
         new_width = 4 * (s->timing[HBLANK_START] - s->timing[HBLANK_CLEAR]);
         new_height = s->timing[VBLANK_START] - s->timing[VBLANK_CLEAR];
-        s->size_changed = 0;
+        s->update &= ~UPDATE_SIZE;
         if ((new_width != s->width || new_height != s->height) && new_width > 0 && new_height > 0) {
             s->width = new_width;
             s->height = new_height;
             CG14_INFO("new resolution = %d x %d\n", new_width, new_height);
             qemu_console_resize(s->ds, s->width, s->height);
-            s->dirty = 1;
+            full_update = 1;
         }
+    }
+    if (s->update) {
+        full_update = 1;
+        s->update = 0;
     }
 
     if (!s->width || !s->height) {
@@ -242,7 +256,6 @@ static void cg14_update_display(void *opaque)
         /* blank */
         memset(ds_get_data(s->ds), 0, ds_get_linesize(s->ds) * ds_get_height(s->ds));
         dpy_update(s->ds, 0, 0, s->width, s->height);
-        s->dirty = 0;
         return;
     }
 
@@ -256,7 +269,7 @@ static void cg14_update_display(void *opaque)
     for (y = 0; y < s->height; y++) {
         ram_addr_t page0 = offset & TARGET_PAGE_MASK;
         ram_addr_t page1 = (offset + src_linesize - 1) & TARGET_PAGE_MASK;
-        int update = s->dirty;
+        int update = full_update;
 
         /* check dirty flags for each line */
         for (page = page0; page <= page1; page += TARGET_PAGE_SIZE) {
@@ -291,7 +304,6 @@ static void cg14_update_display(void *opaque)
         /* flush to display */
         dpy_update(s->ds, 0, y_start, s->width, y - y_start);
     }
-    s->dirty = 0;
     /* reset modified pages */
     if (page_max >= page_min) {
         cpu_physical_memory_reset_dirty(page_min, page_max + TARGET_PAGE_SIZE,
@@ -303,7 +315,7 @@ static void cg14_invalidate_display(void *opaque)
 {
     CG14State *s = opaque;
 
-    s->dirty = 1;
+    s->update |= UPDATE_REDRAW;
 }
 
 static uint32_t cg14_reg_readb(void *opaque, target_phys_addr_t addr)
@@ -347,11 +359,10 @@ static void cg14_reg_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
     CG14State *s = opaque;
     uint32_t i;
 
-    s->dirty = 1;
-
     switch (addr) {
     case 0x0000:
         s->ctrl.mcr = val;
+        s->update |= UPDATE_FULL;
         if (val & ~0x71) {
             CG14_ERROR("control register (0x%02x) has unimplemented bits set\n", val);
         } else {
@@ -360,6 +371,7 @@ static void cg14_reg_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
         break;
     case 0x0001:
         s->ctrl.ppr = val & 0xf0;
+        s->update |= UPDATE_FULL;
         DPRINTF_CONFIG("write 0x%02x to PPR\n", val);
         break;
     case 0x0007: /* clock control (ICS1562AM-001) */
@@ -375,6 +387,7 @@ static void cg14_reg_writeb(void *opaque, target_phys_addr_t addr, uint32_t val)
             s->xlut[i] = val;
             if (val && val != 0x40)
                 CG14_ERROR("writeb xlut[%d] = 0x%02x\n", i, val);
+            s->update |= UPDATE_XLUT;
         }
         break;
     default:
@@ -416,7 +429,7 @@ static void cg14_reg_writew(void *opaque, target_phys_addr_t addr, uint32_t val)
         i = (addr - 0x0018) >> 1;
         s->timing[i] = val;
         if (i == HBLANK_CLEAR || i == VBLANK_CLEAR) {
-            s->size_changed = 1;
+            s->update |= UPDATE_SIZE;
         }
         break;
     }
@@ -459,18 +472,18 @@ static void cg14_reg_writel(void *opaque, target_phys_addr_t addr, uint32_t val)
         s->xlut[i+1] = (uint8_t)(val >> 16);
         s->xlut[i+2] = (uint8_t)(val >> 8);
         s->xlut[i+3] = (uint8_t)val;
-        s->dirty = 1;
+        s->update |= UPDATE_XLUT;
         break;
     case 0x4000 ... 0x43ff:
         if (s->clut1[i >> 2] != val) {
             s->clut1[i >> 2] = val;
-            s->dirty = 1;
+            s->update |= UPDATE_CLUT;
         }
         break;
     case 0x5000 ... 0x53ff:
         if (s->clut2[i >> 2] != val) {
             s->clut2[i >> 2] = val;
-            s->dirty = 1;
+            s->update |= UPDATE_CLUT;
         }
         break;
     default:
@@ -778,7 +791,7 @@ static void cg14_reset(DeviceState *d)
 
     /* set to 8bpp so last prom output might be visible */
     s->ctrl.mcr = CG14_MCR_VIDENABLE | CG14_MCR_PIXMODE_8;
-    s->dirty = 1;
+    s->update = UPDATE_FULL;
 }
 
 static SysBusDeviceInfo cg14_info = {
