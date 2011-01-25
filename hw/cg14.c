@@ -120,6 +120,8 @@ typedef struct CG14State {
     SysBusDevice busdev;
     DisplayState *ds;
 
+    ram_addr_t vram_offset;
+    int vram_memtype;
     uint8_t *vram;
     uint32_t vram_size;
     uint32_t vram_amask;
@@ -186,11 +188,11 @@ static void cg14_draw_line32_rgb32(const CG14State *s, void *dst, const uint8_t 
     }
 }
 
-/* TODO: use VGA_DIRTY_FLAG */
 static void cg14_update_display(void *opaque)
 {
     CG14State *s = opaque;
-    int y, src_linesize;
+    ram_addr_t page, page_min, page_max;
+    int y, y_start, offset, src_linesize;
     uint8_t *pix;
     uint8_t *data;
     int new_width, new_height;
@@ -209,7 +211,7 @@ static void cg14_update_display(void *opaque)
         }
     }
 
-    if (!s->dirty || !s->width || !s->height) {
+    if (!s->width || !s->height) {
         return;
     }
 
@@ -244,16 +246,57 @@ static void cg14_update_display(void *opaque)
         return;
     }
 
+    y_start = -1;
+    page_min = -1;
+    page_max = 0;
+    offset = s->vram_offset;
     pix = s->vram;
     data = ds_get_data(s->ds);
 
     for (y = 0; y < s->height; y++) {
-        draw_line(s, data, pix, s->width);
+        ram_addr_t page0 = offset & TARGET_PAGE_MASK;
+        ram_addr_t page1 = (offset + src_linesize - 1) & TARGET_PAGE_MASK;
+        int update = s->dirty;
+
+        /* check dirty flags for each line */
+        for (page = page0; page <= page1; page += TARGET_PAGE_SIZE) {
+            if (cpu_physical_memory_get_dirty(page, VGA_DIRTY_FLAG)) {
+                update = 1;
+                break;
+            }
+        }
+
+        if (update) {
+            if (y_start < 0) {
+                y_start = y;
+            }
+            if (page0 < page_min) {
+                page_min = page0;
+            }
+            page_max = page1;
+
+            draw_line(s, data, pix, s->width);
+        } else {
+            if (y_start >= 0) {
+                /* flush to display */
+                dpy_update(s->ds, 0, y_start, s->width, y - y_start);
+                y_start = -1;
+            }
+        }
+        offset += src_linesize;
         pix += src_linesize;
         data += ds_get_linesize(s->ds);
     }
-    dpy_update(s->ds, 0, 0, s->width, s->height);
+    if (y_start >= 0) {
+        /* flush to display */
+        dpy_update(s->ds, 0, y_start, s->width, y - y_start);
+    }
     s->dirty = 0;
+    /* reset modified pages */
+    if (page_max >= page_min) {
+        cpu_physical_memory_reset_dirty(page_min, page_max + TARGET_PAGE_SIZE,
+                                        VGA_DIRTY_FLAG);
+    }
 }
 
 static void cg14_invalidate_display(void *opaque)
@@ -407,8 +450,6 @@ static void cg14_reg_writel(void *opaque, target_phys_addr_t addr, uint32_t val)
     CG14State *s = opaque;
     uint32_t i;
 
-    s->dirty = 1;
-
     i = addr & 0x3fc;
     switch (addr) {
     case 0x1000 ... 0x10ff: /* cursor - not implemented */
@@ -418,12 +459,19 @@ static void cg14_reg_writel(void *opaque, target_phys_addr_t addr, uint32_t val)
         s->xlut[i+1] = (uint8_t)(val >> 16);
         s->xlut[i+2] = (uint8_t)(val >> 8);
         s->xlut[i+3] = (uint8_t)val;
+        s->dirty = 1;
         break;
     case 0x4000 ... 0x43ff:
-        s->clut1[i >> 2] = val;
+        if (s->clut1[i >> 2] != val) {
+            s->clut1[i >> 2] = val;
+            s->dirty = 1;
+        }
         break;
     case 0x5000 ... 0x53ff:
-        s->clut2[i >> 2] = val;
+        if (s->clut2[i >> 2] != val) {
+            s->clut2[i >> 2] = val;
+            s->dirty = 1;
+        }
         break;
     default:
         CG14_ERROR("writel %08x to reg %x\n", val, (int)addr);
@@ -473,27 +521,29 @@ static void cg14_vram_writeb(void *opaque, target_phys_addr_t addr, uint32_t val
     CG14State *s = opaque;
     uint32_t offset;
 
-    s->dirty = 1;
-
     switch (addr & 0x3000000) {
     case 0x0000000:
         offset = addr & s->vram_amask;
         stb_p(s->vram+offset, val);
+        cpu_physical_memory_set_dirty(s->vram_offset+offset);
         break;
     case 0x1000000:
         offset = addr & s->vram_amask;
         /* block writes to X */
         if (offset & 3) {
             stb_p(s->vram+offset, val);
+            cpu_physical_memory_set_dirty(s->vram_offset+offset);
         }
         break;
     case 0x2000000:
         offset = ((addr << 1) & s->vram_amask) + ((addr >> 23) & 1);
         stb_p(s->vram+offset, val);
+        cpu_physical_memory_set_dirty(s->vram_offset+offset);
         break;
     case 0x3000000:
         offset = ((addr << 2) & s->vram_amask) + ((addr >> 22) & 3);
         stb_p(s->vram+offset, val);
+        cpu_physical_memory_set_dirty(s->vram_offset+offset);
         break;
     }
 }
@@ -550,12 +600,11 @@ static void cg14_vram_writel(void *opaque, target_phys_addr_t addr, uint32_t val
     CG14State *s = opaque;
     uint32_t offset;
 
-    s->dirty = 1;
-
     switch (addr & 0x3000000) {
     case 0x0000000:
         offset = addr & s->vram_amask;
         stl_be_p(s->vram+offset, val);
+        cpu_physical_memory_set_dirty(s->vram_offset+offset);
         break;
     case 0x1000000:
         offset = addr & s->vram_amask;
@@ -563,6 +612,7 @@ static void cg14_vram_writel(void *opaque, target_phys_addr_t addr, uint32_t val
         stb_p(s->vram+offset+1, val >> 16);
         stb_p(s->vram+offset+2, val >> 8);
         stb_p(s->vram+offset+3, val);
+        cpu_physical_memory_set_dirty(s->vram_offset+offset);
         break;
     case 0x2000000:
         offset = ((addr << 1) & s->vram_amask) + ((addr >> 23) & 1);
@@ -570,6 +620,7 @@ static void cg14_vram_writel(void *opaque, target_phys_addr_t addr, uint32_t val
         stb_p(s->vram+offset+2, val >> 16);
         stb_p(s->vram+offset+4, val >> 8);
         stb_p(s->vram+offset+6, val);
+        cpu_physical_memory_set_dirty(s->vram_offset+offset);
         break;
     case 0x3000000:
         offset = ((addr << 2) & s->vram_amask) + ((addr >> 22) & 3);
@@ -577,6 +628,7 @@ static void cg14_vram_writel(void *opaque, target_phys_addr_t addr, uint32_t val
         stb_p(s->vram+offset+4,  val >> 16);
         stb_p(s->vram+offset+8,  val >> 8);
         stb_p(s->vram+offset+12, val);
+        cpu_physical_memory_set_dirty(s->vram_offset+offset);
         break;
     }
 }
@@ -618,14 +670,11 @@ static void cg14_set_monitor_id(CG14State *s)
 static int cg14_init1(SysBusDevice *dev)
 {
     CG14State *s = FROM_SYSBUS(CG14State, dev);
-    ram_addr_t vram_offset;
-    uint8_t *vram;
     int ctrl_memtype, vram_memtype;
 
-    vram_offset = qemu_ram_alloc(NULL, "cg14.vram", s->vram_size);
-    vram = qemu_get_ram_ptr(vram_offset);
+    s->vram_offset = qemu_ram_alloc(NULL, "cg14.vram", s->vram_size);
+    s->vram = qemu_get_ram_ptr(s->vram_offset);
 
-    s->vram = vram;
     s->vram_amask = s->vram_size - 1;
 
     ctrl_memtype = cpu_register_io_memory(cg14_reg_read, cg14_reg_write, s,
