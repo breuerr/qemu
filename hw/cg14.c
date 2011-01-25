@@ -667,10 +667,37 @@ static void cg14_set_monitor_id(CG14State *s)
     s->ctrl.msr = id << 1;
 }
 
+static void cg14_vram_map(SysBusDevice *dev, target_phys_addr_t base)
+{
+    CG14State *s = FROM_SYSBUS(CG14State, dev);
+    ram_addr_t map;
+
+    /* RAM for XRGB mapping */
+    map = s->vram_offset;
+    cpu_register_physical_memory(base, s->vram_size, map);
+    /* mirror for size detection */
+    if (s->vram_size <= 0x400000) {
+        cpu_register_physical_memory(base+0x400000, s->vram_size, map);
+    }
+    if (s->vram_size <= 0x800000) {
+        cpu_register_physical_memory(base+0x800000, s->vram_size, map);
+    }
+
+    /* ROMD for RGB mapping (read as memory, write as device) */
+    base += 0x1000000;
+    map = s->vram_offset | IO_MEM_ROMD | s->vram_memtype;
+    cpu_register_physical_memory_offset(base, s->vram_size, map, 0x1000000);
+
+    /* mmio device for byte plane mappings */
+    base += 0x1000000;
+    map = s->vram_memtype;
+    cpu_register_physical_memory_offset(base, 0x2000000, map, 0x2000000);
+}
+
 static int cg14_init1(SysBusDevice *dev)
 {
     CG14State *s = FROM_SYSBUS(CG14State, dev);
-    int ctrl_memtype, vram_memtype;
+    int ctrl_memtype;
 
     s->vram_offset = qemu_ram_alloc(NULL, "cg14.vram", s->vram_size);
     s->vram = qemu_get_ram_ptr(s->vram_offset);
@@ -681,10 +708,9 @@ static int cg14_init1(SysBusDevice *dev)
                                           DEVICE_BIG_ENDIAN);
     sysbus_init_mmio(dev, CG14_REG_SIZE, ctrl_memtype);
 
-    /* TODO: register first vram mapping as ram with dirty tracking */
-    vram_memtype = cpu_register_io_memory(cg14_vram_read, cg14_vram_write,
-                                          s, DEVICE_BIG_ENDIAN);
-    sysbus_init_mmio(dev, CG14_VMEM_SLOTSIZE, vram_memtype);
+    s->vram_memtype = cpu_register_io_memory(cg14_vram_read, cg14_vram_write,
+                                             s, DEVICE_BIG_ENDIAN);
+    sysbus_init_mmio_cb(dev, CG14_VMEM_SLOTSIZE, cg14_vram_map);
 
     s->ds = graphic_console_init(cg14_update_display,
                                  cg14_invalidate_display,
