@@ -210,6 +210,24 @@ static cg14_draw_line_func * const cg14_draw_line8_table[CG14_DRAW_LINE_NB] = {
     cg14_draw_line8_fast8_32,
 };
 
+static cg14_draw_line_func * const cg14_draw_line16_table[2 * CG14_DRAW_LINE_NB] = {
+    cg14_draw_line16_8,
+    cg14_draw_line16_15,
+    cg14_draw_line16_16,
+    cg14_draw_line16_24,
+    cg14_draw_line16_32,
+    cg14_draw_line16_24bgr,
+    cg14_draw_line16_32bgr,
+
+    cg14_draw_line16_fast8_8,
+    cg14_draw_line16_fast8_16,
+    cg14_draw_line16_fast8_16,
+    cg14_draw_line16_fast8_24,
+    cg14_draw_line16_fast8_32,
+    cg14_draw_line16_fast8_24,
+    cg14_draw_line16_fast8_32,
+};
+
 static cg14_draw_line_func * const cg14_draw_line32_table[3 * CG14_DRAW_LINE_NB] = {
     cg14_draw_line32_8,
     cg14_draw_line32_15,
@@ -347,6 +365,10 @@ static void cg14_update_display(void *opaque)
             break;
         case CG14_MCR_PIXMODE_16:
             src_linesize *= 2;
+            if (s->single_xlut && s->single_clut) {
+                depth_index += CG14_DRAW_LINE_NB;
+            }
+            draw_line = cg14_draw_line16_table[depth_index];
             break;
         case CG14_MCR_PIXMODE_32:
             src_linesize *= 4;
@@ -868,6 +890,7 @@ static void cg14_screen_dump(void *opaque, const char *filename)
         break;
     case CG14_MCR_PIXMODE_16:
         src_linesize = s->width * 2;
+        draw_line = cg14_draw_line16_24bgr;
         break;
     case CG14_MCR_PIXMODE_32:
         src_linesize = s->width * 4;

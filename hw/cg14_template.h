@@ -86,6 +86,25 @@ static void glue(cg14_draw_line8_fast8_, DEPTH)(const CG14State *s,
     }
 }
 
+static void glue(cg14_draw_line16_fast8_, DEPTH)(const CG14State *s,
+                 void *dst, const uint8_t *src, int width)
+{
+    uint8_t xlut_val;
+    PIXEL_TYPE *p = dst;
+    const uint32_t *palette = s->palette;
+
+    // FIXME: do 2,3 map to 0,1 or 1,1 ?
+    xlut_val = s->xlut[*src];
+    if (xlut_val & 0x30) {
+        src += xlut_val & 0x03;
+    } else {
+        src += (xlut_val >> 2) & 0x03;
+    }
+    for ( ; width > 0; width--, src += 2) {
+        COPY_PIXEL(p, palette[*src]);
+    }
+}
+
 static void glue(cg14_draw_line32_fast8_, DEPTH)(const CG14State *s,
                  void *dst, const uint8_t *src, int width)
 {
@@ -144,6 +163,34 @@ static void glue(cg14_draw_line8_, PIXEL_NAME)(const CG14State *s,
     }
 }
 #endif /* GENERIC_8BIT */
+
+/*
+ *  generic 16-bit mode without blend
+ */
+static void glue(cg14_draw_line16_, PIXEL_NAME)(const CG14State *s,
+                 void *dst, const uint8_t *src, int width)
+{
+    unsigned int x, c;
+    uint8_t xlut_val;
+    uint32_t dval;
+    PIXEL_TYPE *p = dst;
+
+    for ( ; width > 0; width--) {
+        x = src[0];
+        c = src[1];
+        xlut_val = s->xlut[x];
+        src += 2;
+
+        /* FIXME: */
+        if (xlut_val == 0x40) {
+            dval = LUT_TO_PIXEL(s->clut1[x]);
+        } else {
+            /* fallback to green/blue just to display something if unimplemented */
+            dval = RGB_TO_PIXEL(0, x, c);
+        }
+        COPY_PIXEL(p, dval);
+    }
+}
 
 /*
  *  generic 32-bit mode without blend
