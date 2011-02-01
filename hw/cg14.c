@@ -24,6 +24,7 @@
 
 #include "console.h"
 #include "sysbus.h"
+#include "pixel_ops.h"
 
 //#define DEBUG_CG14
 //#define DEBUG_CONFIG
@@ -135,6 +136,7 @@ typedef struct CG14State {
         UPDATE_XLUT   = 1 << 3,
         UPDATE_FULL   = 0x0f
     } update;
+    int single_xlut, single_clut;
 
     struct {
         uint8_t mcr;
@@ -143,8 +145,10 @@ typedef struct CG14State {
     } ctrl;
     uint16_t timing[CG14_TIMING_MAX];
     uint8_t xlut[256];
-    uint32_t clut1[256];
-    uint32_t clut2[256];
+    uint32_t *clut1;
+    uint32_t *clut2;
+    uint32_t hw_cluts[4*256];
+    uint32_t palette[256];
 } CG14State;
 
 static void cg14_screen_dump(void *opaque, const char *filename);
@@ -152,47 +156,148 @@ static void cg14_invalidate_display(void *opaque);
 
 typedef void cg14_draw_line_func(const CG14State *s, void *dst, const uint8_t *src, int width);
 
-static inline uint32_t bgr_to_rgb(uint32_t bgr)
+#define DEPTH 8
+#include "cg14_template.h"
+#define DEPTH 15
+#include "cg14_template.h"
+#define DEPTH 16
+#include "cg14_template.h"
+#define DEPTH 24
+#include "cg14_template.h"
+#define DEPTH 24
+#define BGR_FORMAT
+#define GENERIC_8BIT
+#include "cg14_template.h"
+#define DEPTH 32
+#include "cg14_template.h"
+#define DEPTH 32
+#define BGR_FORMAT
+#include "cg14_template.h"
+
+static inline int get_depth_index(DisplayState *s)
 {
-    uint32_t rgb;
-
-    /* swap r & b */
-    rgb = (bgr & 0x00FF00)
-        | (bgr & 0x0000FF) << 16
-        | (bgr & 0xFF0000) >> 16;
-    return rgb;
-}
-
-// TODO: draw_line templates
-static void cg14_draw_line8_rgb32(const CG14State *s, void *dst, const uint8_t *src, int width)
-{
-    int i;
-    const uint32_t *clut;
-    uint32_t *p = dst;
-
-    clut = s->clut1;
-    for (i = 0; i < width; i++) {
-        *p++ = bgr_to_rgb(clut[src[i]]);
+    int idx;
+    switch (ds_get_bits_per_pixel(s)) {
+    default:
+    case 8:
+        return 0;
+    case 15:
+        return 1;
+    case 16:
+        return 2;
+    case 24:
+        idx = 3;
+        break;
+    case 32:
+        idx = 4;
+        break;
     }
+    if (is_surface_bgr(s->surface)) {
+        idx += 2;
+    }
+    return idx;
 }
 
-static void cg14_draw_line32_rgb32(const CG14State *s, void *dst, const uint8_t *src, int width)
+#define CG14_DRAW_LINE_NB  7
+
+static cg14_draw_line_func * const cg14_draw_line8_table[CG14_DRAW_LINE_NB] = {
+    cg14_draw_line8_fast8_8,
+    cg14_draw_line8_fast8_16,
+    cg14_draw_line8_fast8_16,
+    cg14_draw_line8_fast8_24,
+    cg14_draw_line8_fast8_32,
+    cg14_draw_line8_fast8_24,
+    cg14_draw_line8_fast8_32,
+};
+
+static cg14_draw_line_func * const cg14_draw_line32_table[3 * CG14_DRAW_LINE_NB] = {
+    cg14_draw_line32_8,
+    cg14_draw_line32_15,
+    cg14_draw_line32_16,
+    cg14_draw_line32_24,
+    cg14_draw_line32_32,
+    cg14_draw_line32_24bgr,
+    cg14_draw_line32_32bgr,
+
+    cg14_draw_line32_fast8_8,
+    cg14_draw_line32_fast8_16,
+    cg14_draw_line32_fast8_16,
+    cg14_draw_line32_fast8_24,
+    cg14_draw_line32_fast8_32,
+    cg14_draw_line32_fast8_24,
+    cg14_draw_line32_fast8_32,
+
+    cg14_draw_line32_fast32_8,
+    cg14_draw_line32_fast32_15,
+    cg14_draw_line32_fast32_16,
+    cg14_draw_line32_fast32_24,
+    cg14_draw_line32_fast32_32,
+    cg14_draw_line32_fast32_24bgr,
+    cg14_draw_line32_fast32_32bgr,
+};
+
+static void cg14_update_palette(CG14State *s)
 {
-    int i;
-    unsigned int r, g, b;
-    uint32_t dval;
-    uint32_t *p = dst;
+    const uint32_t *clut;
+    uint8_t xlut_val;
+    unsigned int i, alpha;
 
-    for (i = 0; i < width; i++) {
-        b = src[1];
-        g = src[2];
-        r = src[3];
-        src += 4;
+    s->single_xlut = 1;
+    if ((s->ctrl.mcr & CG14_MCR_PIXMODE_MASK) == CG14_MCR_PIXMODE_8) {
+        xlut_val = s->ctrl.ppr;
+    } else {
+        xlut_val = s->xlut[0];
+        /* are all xlut values the same? */
+        for (i = 1; i < 256; i++) {
+            if (s->xlut[i] != xlut_val) {
+                s->single_xlut = 0;
+                break;
+            }
+        }
+    }
+    clut = s->hw_cluts;
+    if (xlut_val & 0x30) {
+        clut += 256 * (xlut_val & 0x30) >> 4;
+        /* check clut alpha, are they all the same? */
+        alpha = clut[0] >> 24;
+        for (i = 1; i < 256; i++) {
+            if (clut[i] >> 24 != alpha) {
+                break;
+            }
+        }
+        s->single_clut = (i == 256 && alpha == 0);
+    } else {
+        clut += 256 * (xlut_val & 0xc0) >> 6;
+        s->single_clut = 1;
+    }
 
-        /* xlut = 0x00 for true-color */
-        dval = r << 16 | g << 8 | b;
-
-        *p++ = dval;
+    for (i = 0; i < 256; i++) {
+        switch (ds_get_bits_per_pixel(s->ds)) {
+        default:
+        case 8:
+            s->palette[i] = cg14_lut_to_pixel8(clut[i]);
+            break;
+        case 15:
+            s->palette[i] = cg14_lut_to_pixel15(clut[i]);
+            break;
+        case 16:
+            s->palette[i] = cg14_lut_to_pixel16(clut[i]);
+            break;
+        case 24:
+            if (is_surface_bgr(s->ds->surface)) {
+                s->palette[i] = cg14_lut_to_pixel24bgr(clut[i]);
+            } else {
+                s->palette[i] = cg14_lut_to_pixel24(clut[i]);
+            }
+            break;
+        case 32:
+            if (is_surface_bgr(s->ds->surface)) {
+                s->palette[i] = cg14_lut_to_pixel32bgr(clut[i]);
+            } else {
+                s->palette[i] = cg14_lut_to_pixel32(clut[i]);
+            }
+            break;
+        }
     }
 }
 
@@ -204,6 +309,7 @@ static void cg14_update_display(void *opaque)
     uint8_t *pix;
     uint8_t *data;
     int new_width, new_height;
+    int depth_index;
     int full_update;
     cg14_draw_line_func *draw_line;
 
@@ -221,6 +327,7 @@ static void cg14_update_display(void *opaque)
         }
     }
     if (s->update) {
+        cg14_update_palette(s);
         full_update = 1;
         s->update = 0;
     }
@@ -229,26 +336,26 @@ static void cg14_update_display(void *opaque)
         return;
     }
 
-    if (ds_get_bits_per_pixel(s->ds) != 32) {
-        CG14_ERROR("cg14_update: FIXME: bpp (%d) != 32, linesize %d\n",
-            ds_get_bits_per_pixel(s->ds), ds_get_linesize(s->ds));
-        return;
-    }
-    // if (is_surface_bgr(s->ds->surface))
+    depth_index = get_depth_index(s->ds);
 
     draw_line = NULL;
     src_linesize = s->width;
     if (s->ctrl.mcr & CG14_MCR_VIDENABLE) {
         switch (s->ctrl.mcr & CG14_MCR_PIXMODE_MASK) {
         case CG14_MCR_PIXMODE_8:
-            draw_line = cg14_draw_line8_rgb32;
+            draw_line = cg14_draw_line8_table[depth_index];
             break;
         case CG14_MCR_PIXMODE_16:
             src_linesize *= 2;
             break;
         case CG14_MCR_PIXMODE_32:
             src_linesize *= 4;
-            draw_line = cg14_draw_line32_rgb32;
+            if (s->single_xlut && s->xlut[0] == 0x00) {
+                depth_index += 2 * CG14_DRAW_LINE_NB;
+            } else if (s->single_xlut && s->single_clut) {
+                depth_index += CG14_DRAW_LINE_NB;
+            }
+            draw_line = cg14_draw_line32_table[depth_index];
             break;
         }
     }
@@ -711,11 +818,20 @@ static int cg14_init1(SysBusDevice *dev)
 {
     CG14State *s = FROM_SYSBUS(CG14State, dev);
     int ctrl_memtype;
+    int i;
 
     s->vram_offset = qemu_ram_alloc(NULL, "cg14.vram", s->vram_size);
     s->vram = qemu_get_ram_ptr(s->vram_offset);
 
     s->vram_amask = s->vram_size - 1;
+
+    /* 4 luts of 256 32-bit values */
+    s->clut1 = s->hw_cluts + 256;
+    s->clut2 = s->hw_cluts + 256*2;
+    for (i = 0; i < 256; i++) {
+        /* lut0 = fixed grayscale */
+        s->hw_cluts[i] = rgb_to_pixel24(i, i, i) | (0xff << 24);
+    }
 
     ctrl_memtype = cpu_register_io_memory(cg14_reg_read, cg14_reg_write, s,
                                           DEVICE_BIG_ENDIAN);
@@ -748,15 +864,14 @@ static void cg14_screen_dump(void *opaque, const char *filename)
     switch (s->ctrl.mcr & CG14_MCR_PIXMODE_MASK) {
     case CG14_MCR_PIXMODE_8:
         src_linesize = s->width;
-        // draw_line = cg14_draw_line8_bgr24;
+        draw_line = cg14_draw_line8_24bgr;
         break;
     case CG14_MCR_PIXMODE_16:
         src_linesize = s->width * 2;
-        // draw_line = cg14_draw_line16_bgr24;
         break;
     case CG14_MCR_PIXMODE_32:
         src_linesize = s->width * 4;
-        // draw_line = cg14_draw_line32_bgr24;
+        draw_line = cg14_draw_line32_24bgr;
         break;
     default:
         /* blank */
