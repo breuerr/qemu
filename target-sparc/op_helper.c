@@ -1752,6 +1752,8 @@ void leon3_irq_manager(void *irq_manager, int intno)
     leon3_cache_control_int();
 }
 
+static uint32_t bp_action = 0;
+
 uint64_t helper_ld_asi(target_ulong addr, int asi, int size, int sign)
 {
     uint64_t ret = 0;
@@ -1940,8 +1942,10 @@ uint64_t helper_ld_asi(target_ulong addr, int asi, int size, int sign)
     case 0x31: // Turbosparc RAM snoop
     case 0x32: // Turbosparc page table descriptor diagnostic
     case 0x39: /* data cache diagnostic register */
-    case 0x4c: /* SuperSPARC MMU Breakpoint Action register */
         ret = 0;
+        break;
+    case 0x4c: /* SuperSPARC MMU Breakpoint Action register */
+        ret = bp_action;
         break;
     case 0x38: /* SuperSPARC MMU Breakpoint Control Registers */
         {
@@ -2304,7 +2308,9 @@ void helper_st_asi(target_ulong addr, uint64_t val, int asi, int size)
                // descriptor diagnostic
     case 0x36: /* I-cache flash clear */
     case 0x37: /* D-cache flash clear */
+        break;
     case 0x4c: /* breakpoint action */
+        bp_action = val & 0x1000; /* action_mix - multiple instructions? */
         break;
     case 0x38: /* SuperSPARC MMU Breakpoint Control Registers*/
         {
