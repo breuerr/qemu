@@ -117,6 +117,19 @@ cs4231_mem_readl_reg(uint32_t reg, uint32_t ret) "read reg %d: 0x%08x"
 cs4231_mem_writel_reg(uint32_t reg, uint32_t old, uint32_t val) "write reg %d: 0x%08x -> 0x%08x"
 cs4231_mem_writel_dreg(uint32_t reg, uint32_t old, uint32_t val) "write dreg %d: 0x%02x -> 0x%02x"
 
+# hw/dbri.c
+dbri_readl(uint64_t addr, uint32_t val) "addr=%"PRId64": 0x%08x"
+dbri_writel(uint64_t addr, uint32_t val) "addr=%"PRId64": 0x%08x"
+dbri_dma_read32(uint32_t addr, uint32_t val) "addr=0x%08x: 0x%08x"
+dbri_dma_write32(uint32_t addr, uint32_t val) "addr=0x%08x: 0x%08x"
+dbri_interrupt(uint32_t val, const char *name, unsigned int chan, uint32_t field) "(0x%08x) %s, chan %d, field 0x%05x"
+dbri_command(uint32_t cmd, const char *name) "0x%08x = %s"
+dbri_setup_data_pointer(unsigned int pipe, uint32_t ptr) "pipe %d: 0x%08x"
+dbri_insert_time_slot_in(unsigned int pipe, unsigned int prev, unsigned int next, int start, int len) "pipe %d: prev=%d, next=%d, start=%d, len=%d"
+dbri_delete_time_slot_in(unsigned int pipe, unsigned int prev) "pipe %d: prev=%d"
+dbri_insert_time_slot_out(unsigned int pipe, unsigned int prev, unsigned int next, int start, int len) "pipe %d: prev=%d, next=%d, start=%d, len=%d"
+dbri_delete_time_slot_out(unsigned int pipe, unsigned int prev) "pipe %d: prev=%d"
+
 # hw/ds1225y.c
 nvram_read(uint32_t addr, uint32_t ret) "read addr %d: 0x%02x"
 nvram_write(uint32_t addr, uint32_t old, uint32_t val) "write addr %d: 0x%02x -> 0x%02x"
