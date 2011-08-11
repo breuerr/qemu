@@ -421,6 +421,20 @@ static void lance_init(NICInfo *nd, target_phys_addr_t leaddr,
     qdev_connect_gpio_out(dma_opaque, 0, reset);
 }
 
+static void dbri_init(target_phys_addr_t daddr, qemu_irq parent_irq,
+                      void *iommu)
+{
+    DeviceState *dev;
+    SysBusDevice *s;
+
+    dev = qdev_create(NULL, "SUNW,DBRIe");
+    qdev_prop_set_ptr(dev, "iommu_opaque", iommu);
+    qdev_init_nofail(dev);
+    s = sysbus_from_qdev(dev);
+    sysbus_connect_irq(s, 0, parent_irq);
+    sysbus_mmio_map(s, 0, daddr);
+}
+
 static DeviceState *slavio_intctl_init(target_phys_addr_t addr,
                                        target_phys_addr_t addrg,
                                        qemu_irq **parent_irq)
@@ -943,10 +957,7 @@ static void sun4m_hw_init(const struct sun4m_hwdef *hwdef, ram_addr_t RAM_size,
 
     if (hwdef->dbri_base) {
         /* ISDN chip with attached CS4215 audio codec */
-        /* prom space */
-        empty_slot_init(hwdef->dbri_base+0x1000, 0x30);
-        /* reg space */
-        empty_slot_init(hwdef->dbri_base+0x10000, 0x100);
+        dbri_init(hwdef->dbri_base, slavio_irq[11], iommu);
     }
 
     if (hwdef->bpp_base) {
