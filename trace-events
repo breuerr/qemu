@@ -129,6 +129,14 @@ dbri_insert_time_slot_in(unsigned int pipe, unsigned int prev, unsigned int next
 dbri_delete_time_slot_in(unsigned int pipe, unsigned int prev) "pipe %d: prev=%d"
 dbri_insert_time_slot_out(unsigned int pipe, unsigned int prev, unsigned int next, int start, int len) "pipe %d: prev=%d, next=%d, start=%d, len=%d"
 dbri_delete_time_slot_out(unsigned int pipe, unsigned int prev) "pipe %d: prev=%d"
+dbri_pipe_out_list_error(void) "linked list loop before OUT anchor"
+dbri_pipe_in_list_error(void) "linked list loop before IN anchor"
+dbri_pipe_out_list(unsigned int i, uint32_t desc, int start, int len) "pipe %d, 0x%08x = start %d, len %d"
+dbri_pipe_in_list(unsigned int i, uint32_t desc, int start, int len) "pipe %d, 0x%08x = start %d, len %d"
+dbri_codec_read_data(int slot, uint8_t data) "slot %d: 0x%02x"
+dbri_codec_read_control(int slot, uint8_t data) "slot %d: 0x%02x"
+dbri_codec_write_data(int slot, uint8_t data) "slot %d: 0x%02x"
+dbri_codec_write_control(int slot, uint8_t data) "slot %d: 0x%02x"
 
 # hw/ds1225y.c
 nvram_read(uint32_t addr, uint32_t ret) "read addr %d: 0x%02x"

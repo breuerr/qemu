@@ -37,12 +37,22 @@
  *  NetBSD driver: src/sys/dev/sbus/dbri*
  *
  *  Unimplemented:
- *    audio codec
+ *    audio
  *    isdn
  *    iommu errors (sbus faults)
  *    monitor pipes (for 8-bit stereo?)
  */
 
+
+typedef struct CS4215State {
+    int data_mode;
+    int freq;
+
+    uint8_t status;
+    uint8_t data_format;
+    uint8_t port_control;
+    uint8_t settings[4];
+} CS4215State;
 
 typedef struct DBRIPipeState {
     uint32_t setup, ptr, data;
@@ -72,6 +82,15 @@ typedef struct DBRIState {
     uint32_t chi_data_mode;
 
     DBRIPipeState pipe[32];
+
+    bool pipe_update;
+
+    struct {
+        uint32_t pipe, ctrl;
+        bool stopped;
+    } play, rec;
+
+    CS4215State codec;
 } DBRIState;
 
 
@@ -176,6 +195,168 @@ enum dbri_int_code {    /* interrupt codes */
 #define DBRI_CHI_IS_MASTER(s)   (DBRI_CHI_CLOCK(s) >= 3)
 
 
+/* audio codec */
+/* control slot 1 = status */
+#define CS4215_CLB              (1 << 2)  /* control latch bit */
+#define CS4215_STATUS_RWMASK    0x1f
+#define CS4215_STATUS_FIXED     0x20      /* upper 3 bits fixed at 001 */
+#define CS4215_CLB_CLEAR(st)    (((st) & 0x1b) | 0x20)
+
+/* control slot 2 = data format */
+#define CS4215_DFR_MASK         (7 << 3)  /* data frequency rate */
+#define CS4215_ST               (1 << 2)  /* stereo */
+#define CS4215_DF_MASK          (3 << 0)  /* data format */
+#define CS4215_DF_U8            (3 << 0)
+#define CS4215_DF_ALAW          (2 << 0)
+#define CS4215_DF_ULAW          (1 << 0)
+#define CS4215_DF_S16           (0 << 0)
+#define CS4215_DFR_EXTRACT(d)   (((d) & CS4215_DFR_MASK) >> 3)
+
+/* control slot 3 = port control */
+#define CS4215_MCK_MASK         (7 << 4)  /* clock source select */
+#define CS4215_MCK_XTAL2        (2 << 4)
+#define CS4215_MCK_XTAL1        (1 << 4)
+#define CS4215_BSEL_MASK        (3 << 2)
+#define CS4215_BSEL_256         (2 << 2)
+#define CS4215_XCLK             (1 << 1)  /* transmit clock master mode */
+#define CS4215_XEN              (1 << 0)
+
+#define CODEC_IS_MASTER(c)  \
+            ((c)->data_mode && ((c)->port_control & CS4215_XCLK))
+
+/* 2 clocks, 8 clock dividers */
+#define AUD_CLK1  24576000
+#define AUD_CLK2  16934400
+
+static const int cs4215_clk_div[8] = {
+    3072, 1536, 896, 768, 448, 384, 512, 2560
+};
+
+
+/* reverse bits in a byte */
+static uint8_t byte_rev(uint8_t b)
+{
+    b = ((b & 0xf0) >> 4) | ((b & 0x0f) << 4);
+    b = ((b & 0xcc) >> 2) | ((b & 0x33) << 2);
+    b = ((b & 0xaa) >> 1) | ((b & 0x55) << 1);
+
+    return b;
+}
+
+static void cs4215_reset(CS4215State *s)
+{
+    s->status = CS4215_STATUS_FIXED | CS4215_CLB;
+    s->data_format = CS4215_DF_ULAW;
+    s->port_control = CS4215_BSEL_256 | CS4215_XEN;
+    s->settings[0] = 0x3f;
+    s->settings[1] = 0xbf;
+    s->settings[2] = 0xc0;
+    s->settings[3] = 0xf0;
+}
+
+static void cs4215_setmode(CS4215State *s, int mode)
+{
+    int div;
+
+    s->data_mode = mode;
+
+    if (mode) {
+        /* calculate frequency */
+        div = cs4215_clk_div[CS4215_DFR_EXTRACT(s->data_format)];
+
+        switch (s->port_control & CS4215_MCK_MASK) {
+        case CS4215_MCK_XTAL1:
+            s->freq = AUD_CLK1 / div;
+            break;
+        case CS4215_MCK_XTAL2:
+            s->freq = AUD_CLK2 / div;
+            break;
+        default:
+            s->freq = 0;
+            break;
+        }
+    } else {
+        s->freq = 0;
+        s->status = CS4215_CLB_CLEAR(s->status);
+    }
+}
+
+static uint8_t cs4215_read(CS4215State *s, int slot)
+{
+    uint8_t val;
+
+    /* 1-based slot number */
+    if (s->data_mode) {
+        switch (slot) {
+        case 5:
+            val = s->settings[0];
+            break;
+        case 6:
+            val = s->settings[1] & 0x7f;
+            break;
+        case 7:
+            val = s->settings[2] & 0xdf;
+            break;
+        case 8:
+            val = s->settings[3];
+            break;
+        default:
+            val = 0;
+            break;
+        }
+        trace_dbri_codec_read_data(slot, val);
+    } else {
+        switch (slot) {
+        case 1:
+            val = s->status;
+            break;
+        case 2:
+            val = s->data_format;
+            break;
+        case 3:
+            val = s->port_control;
+            break;
+        case 4:
+            val = 0; /* test */
+            break;
+        case 5:
+            val = 0xc0; /* codec pio */
+            break;
+        case 7:
+            val = 0x02; /* Rev E */
+            break;
+        default:
+            val = 0;
+            break;
+        }
+        trace_dbri_codec_read_control(slot, val);
+    }
+    return val;
+}
+
+static void cs4215_write(CS4215State *s, int slot, uint8_t val)
+{
+    if (s->data_mode) {
+        trace_dbri_codec_write_data(slot, val);
+        if (slot >= 5 && slot <= 8) {
+            s->settings[slot - 5] = val;
+        }
+    } else {
+        trace_dbri_codec_write_control(slot, val);
+        switch (slot) {
+        case 1:
+            s->status = (val & CS4215_STATUS_RWMASK) | CS4215_STATUS_FIXED;
+            break;
+        case 2:
+            s->data_format = val;
+            break;
+        case 3:
+            s->port_control = val;
+            break;
+        }
+    }
+}
+
 static uint32_t dbri_dma_read32(DBRIState *s, uint32_t addr)
 {
     uint32_t val;
@@ -233,8 +414,186 @@ static void dbri_post_interrupt(DBRIState *s, unsigned int chan,
     qemu_irq_raise(s->irq);
 }
 
+static void dbri_next_txbuffer(DBRIState *s, unsigned int pipe)
+{
+    uint32_t td_ptr = s->pipe[pipe].ptr;  /* transmit descriptor */
+
+    s->play.ctrl = dbri_dma_read32(s, td_ptr); /* control/length */
+    if (s->play.ctrl & DBRI_TD_MINT) {
+        /* marker int */
+        dbri_post_interrupt(s, pipe, INTR_MINT, td_ptr);
+    }
+    /* get data pointer, re-use pipe data field */
+    s->pipe[pipe].data = dbri_dma_read32(s, td_ptr+4);
+}
+
+static void dbri_next_rxbuffer(DBRIState *s, unsigned int pipe)
+{
+    uint32_t rd_ptr = s->pipe[pipe].ptr;  /* receive descriptor */
+
+    s->rec.ctrl = dbri_dma_read32(s, rd_ptr+12); /* control/length */
+    if (s->rec.ctrl & DBRI_RD_MINT) {
+        /* marker int */
+        dbri_post_interrupt(s, pipe, INTR_MINT, rd_ptr);
+    }
+    /* get data pointer, re-use pipe data field */
+    s->pipe[pipe].data = dbri_dma_read32(s, rd_ptr+4);
+}
+
+static void dbri_start_audio_out(DBRIState *s, unsigned int pipe)
+{
+    if (pipe == s->play.pipe && !s->play.stopped) {
+        return;
+    }
+    /* prepare data buffer */
+    dbri_next_txbuffer(s, pipe);
+
+    s->play.pipe = pipe;
+    s->play.stopped = false;
+}
+
+static void dbri_start_audio_in(DBRIState *s, unsigned int pipe)
+{
+    if (pipe == s->rec.pipe && !s->rec.stopped) {
+        return;
+    }
+    /* prepare data buffer */
+    dbri_next_rxbuffer(s, pipe);
+
+    s->rec.pipe = pipe;
+    s->rec.stopped = false;
+}
+
+static void dbri_stop_audio(DBRIState *s, unsigned int pipe, int abort)
+{
+    if (pipe == s->play.pipe) {
+        if (abort && s->pipe[pipe].ptr) {
+            dbri_dma_write32(s, s->pipe[pipe].ptr+12, DBRI_TD_ABORT);
+        }
+        s->play.stopped = true;
+        s->play.pipe = 0;
+    }
+    if (pipe == s->rec.pipe) {
+        if (abort && s->pipe[pipe].ptr) {
+            dbri_dma_write32(s, s->pipe[pipe].ptr, DBRI_RD_ABORT);
+        }
+        s->rec.stopped = true;
+        s->rec.pipe = 0;
+    }
+}
+
+static bool dbri_chi_is_active(DBRIState *s)
+{
+    if ((s->reg[0] & DBRI_CHI_ACTIVATE)
+        && (DBRI_CHI_IS_MASTER(s) || CODEC_IS_MASTER(&s->codec))) {
+        return true;
+    } else {
+        return false;
+    }
+}
+
+static void dbri_run_pipes(DBRIState *s)
+{
+    unsigned int i;
+    int start, len, codec_slot;
+    uint32_t val;
+    uint32_t been_here;
+
+    if (!dbri_chi_is_active(s)) {
+        return;
+    }
+
+    /* run through the pipes */
+    s->pipe_update = false;
+
+    /* pipe 16 is the anchor where the CHI starts and ends */
+    if (s->chi_data_mode & DBRI_CHI_XEN) {
+        i = s->pipe[16].out_next;
+        been_here = 1 << 16;
+        while (i != 16) {
+            if (been_here & (1 << i)) {
+                trace_dbri_pipe_out_list_error();
+                break;
+            }
+            been_here |= 1 << i;
+            start = SLOT_START(s->pipe[i].out_desc);
+            len = SLOT_LEN(s->pipe[i].out_desc);
+
+            /* use bits per frame instead of 0 for OUT pipes */
+            if (start >= 64) {
+                start = 0;
+            }
+            trace_dbri_pipe_out_list(i, s->pipe[i].out_desc, start, len);
+
+            switch (SDP_MODE(s->pipe[i].setup)) {
+            case SDP_MODE_MEM:
+                if (s->pipe[i].ptr && start == s->codec_offset) {
+                    dbri_start_audio_out(s, i);
+                }
+                break;
+
+            case SDP_MODE_FIXED:
+                /* assume 8-bit alignment */
+                codec_slot = 1 + (start - s->codec_offset) / 8;
+
+                /* fixed pipe is LSB first, codec is MSB first */
+                val = s->pipe[i].data;
+                do {
+                    cs4215_write(&s->codec, codec_slot, byte_rev(val & 0xff));
+                    codec_slot++;
+                    val >>= 8;
+                    len -= 8;
+                } while (len > 0);
+                break;
+            }
+            i = s->pipe[i].out_next;
+        }
+    }
+
+    i = s->pipe[16].in_next;
+    been_here = 1 << 16;
+    while (i != 16) {
+        if (been_here & (1 << i)) {
+            trace_dbri_pipe_in_list_error();
+            break;
+        }
+        been_here |= 1 << i;
+        start = SLOT_START(s->pipe[i].in_desc);
+        len = SLOT_LEN(s->pipe[i].in_desc);
+
+        trace_dbri_pipe_in_list(i, s->pipe[i].in_desc, start, len);
+
+        switch (SDP_MODE(s->pipe[i].setup)) {
+        case SDP_MODE_MEM:
+            if (s->pipe[i].ptr && start == s->codec_offset) {
+                dbri_start_audio_in(s, i);
+            }
+            break;
+
+        case SDP_MODE_FIXED:
+            /* assume 8-bit alignment */
+            codec_slot = 1 + (start - s->codec_offset) / 8;
+
+            /* fixed pipe is LSB first, codec is MSB first */
+            val = byte_rev(cs4215_read(&s->codec, codec_slot));
+            if (len > 8) {
+                val |= byte_rev(cs4215_read(&s->codec, codec_slot+1)) << 8;
+            }
+            if (s->pipe[i].data != val) {
+                s->pipe[i].data = val;
+                if (SDP_REPORT_CHANGE(s->pipe[i].setup)) {
+                    dbri_post_interrupt(s, i, INTR_FXDT, val);
+                }
+            }
+            break;
+        }
+        i = s->pipe[i].in_next;
+    }
+}
+
 static void dbri_cmd_pause(DBRIState *s, uint32_t *cmd)
 {
+    dbri_run_pipes(s);
 }
 
 static void dbri_cmd_jump(DBRIState *s, uint32_t *cmd)
@@ -255,6 +614,11 @@ static void dbri_cmd_sdp(DBRIState *s, uint32_t *cmd)
     unsigned int i = cmd[0] & 0x1f;
 
     s->pipe[i].setup = cmd[0];
+    if (cmd[0] & (SDP_PTR_VALID | SDP_CLEAR | SDP_ABORT)) {
+        if (i) {
+            dbri_stop_audio(s, i, cmd[0] & SDP_ABORT);
+        }
+    }
     if (cmd[0] & SDP_PTR_VALID) {
         trace_dbri_setup_data_pointer(i, cmd[1]);
         s->pipe[i].ptr = cmd[1];
@@ -264,6 +628,14 @@ static void dbri_cmd_sdp(DBRIState *s, uint32_t *cmd)
 /* continue data pipe */
 static void dbri_cmd_cdp(DBRIState *s, uint32_t *cmd)
 {
+    unsigned int i = cmd[0] & 0x1f;
+
+    if (i == s->play.pipe) {
+        s->play.stopped = false;
+    }
+    if (i == s->rec.pipe) {
+        s->rec.stopped = false;
+    }
 }
 
 /* define time slot */
@@ -394,6 +766,7 @@ static void dbri_run_commands(DBRIState *s)
             /* fall through */
         case 4:
             s->cmdq_ptr += command_list[i].len;
+            s->pipe_update = true;
             if (command_list[i].action) {
                 command_list[i].action(s, cmd);
             }
@@ -402,6 +775,9 @@ static void dbri_run_commands(DBRIState *s)
         default:
             s->reg[0] &= ~DBRI_COMMAND_VALID;
             cmd_valid = false;
+            if (s->pipe_update) {
+                dbri_run_pipes(s);
+            }
             break;
         }
     }
@@ -435,11 +811,19 @@ static void dbri_reset(DeviceState *dev)
     s->pipe[16].out_next = 16;
 
     /* clear all pipes */
+    s->pipe_update = false;
     for (i = 0; i < 32; i++) {
         s->pipe[i].setup = 0;
         s->pipe[i].ptr = 0;
         s->pipe[i].data = 0;
     }
+    s->play.pipe = 0;
+    s->rec.pipe = 0;
+    s->play.stopped = true;
+    s->rec.stopped = true;
+
+    cs4215_reset(&s->codec);
+    cs4215_setmode(&s->codec, DBRI_CODEC_DATA_MODE(s));
 }
 
 /* registers */
@@ -501,6 +885,10 @@ static void dbri_reg_write(void *opaque, target_phys_addr_t addr,
         break;
     case 0x08: /* I/O */
         s->pio = (val & DBRI_PIO_EN) ? val : s->pio_default;
+        if (DBRI_CODEC_RESET(s)) {
+            cs4215_reset(&s->codec);
+        }
+        cs4215_setmode(&s->codec, DBRI_CODEC_DATA_MODE(s));
         break;
     case 0x20: /* Command Queue Pointer */
         s->cmdq_ptr = val;
@@ -515,6 +903,8 @@ static void dbri_reg_write(void *opaque, target_phys_addr_t addr,
 static int vmstate_dbri_post_load(void *opaque, int version_id)
 {
     DBRIState *s = opaque;
+
+    cs4215_setmode(&s->codec, DBRI_CODEC_DATA_MODE(s));
 
     if (s->intq_ptr && s->reg[1]) {
         qemu_irq_raise(s->irq);
@@ -615,6 +1005,19 @@ static const VMStateDescription vmstate_dbri = {
 
         VMSTATE_STRUCT_ARRAY(pipe, DBRIState, 32, 1,
                              vmstate_dbri_pipe, DBRIPipeState),
+        VMSTATE_BOOL(pipe_update,  DBRIState),
+
+        VMSTATE_UINT32(play.pipe,  DBRIState),
+        VMSTATE_UINT32(play.ctrl,  DBRIState),
+        VMSTATE_BOOL(play.stopped, DBRIState),
+        VMSTATE_UINT32(rec.pipe,   DBRIState),
+        VMSTATE_UINT32(rec.ctrl,   DBRIState),
+        VMSTATE_BOOL(rec.stopped,  DBRIState),
+
+        VMSTATE_UINT8(codec.status,         DBRIState),
+        VMSTATE_UINT8(codec.data_format,    DBRIState),
+        VMSTATE_UINT8(codec.port_control,   DBRIState),
+        VMSTATE_UINT8_ARRAY(codec.settings, DBRIState, 4),
         VMSTATE_END_OF_LIST()
     }
 };
