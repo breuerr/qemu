@@ -3878,10 +3878,7 @@ esac
 
 if test "$target_softmmu" = "yes" ; then
   case "$TARGET_BASE_ARCH" in
-  arm)
-    cflags="-DHAS_AUDIO $cflags"
-  ;;
-  lm32)
+  arm|lm32|sparc)
     cflags="-DHAS_AUDIO $cflags"
   ;;
   i386|mips|ppc)
