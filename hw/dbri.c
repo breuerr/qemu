@@ -23,6 +23,7 @@
  */
 
 #include "hw.h"
+#include "audio/audio.h"
 #include "sysbus.h"
 #include "sun4m.h"
 #include "trace.h"
@@ -37,7 +38,8 @@
  *  NetBSD driver: src/sys/dev/sbus/dbri*
  *
  *  Unimplemented:
- *    audio
+ *    volume control
+ *    audio record - alaw, ulaw for record?
  *    isdn
  *    iommu errors (sbus faults)
  *    monitor pipes (for 8-bit stereo?)
@@ -47,6 +49,7 @@
 typedef struct CS4215State {
     int data_mode;
     int freq;
+    const int16_t *tbl;
 
     uint8_t status;
     uint8_t data_format;
@@ -66,6 +69,9 @@ typedef struct DBRIState {
     MemoryRegion mem_rom;
     MemoryRegion mem_rom_alias;
     MemoryRegion mem_io;
+
+    QEMUSoundCard card;
+    SWVoiceOut *voice_out;
 
     qemu_irq irq;
     void *iommu;
@@ -87,6 +93,7 @@ typedef struct DBRIState {
 
     struct {
         uint32_t pipe, ctrl;
+        int offset;
         bool stopped;
     } play, rec;
 
@@ -232,6 +239,79 @@ static const int cs4215_clk_div[8] = {
     3072, 1536, 896, 768, 448, 384, 512, 2560
 };
 
+/* MuLaw/ALaw tables are also in cs4231a.c, move to common code? */
+/* Tables courtesy http://hazelware.luggle.com/tutorials/mulawcompression.html */
+static const int16_t MuLawDecompressTable[256] =
+{
+     -32124,-31100,-30076,-29052,-28028,-27004,-25980,-24956,
+     -23932,-22908,-21884,-20860,-19836,-18812,-17788,-16764,
+     -15996,-15484,-14972,-14460,-13948,-13436,-12924,-12412,
+     -11900,-11388,-10876,-10364, -9852, -9340, -8828, -8316,
+      -7932, -7676, -7420, -7164, -6908, -6652, -6396, -6140,
+      -5884, -5628, -5372, -5116, -4860, -4604, -4348, -4092,
+      -3900, -3772, -3644, -3516, -3388, -3260, -3132, -3004,
+      -2876, -2748, -2620, -2492, -2364, -2236, -2108, -1980,
+      -1884, -1820, -1756, -1692, -1628, -1564, -1500, -1436,
+      -1372, -1308, -1244, -1180, -1116, -1052,  -988,  -924,
+       -876,  -844,  -812,  -780,  -748,  -716,  -684,  -652,
+       -620,  -588,  -556,  -524,  -492,  -460,  -428,  -396,
+       -372,  -356,  -340,  -324,  -308,  -292,  -276,  -260,
+       -244,  -228,  -212,  -196,  -180,  -164,  -148,  -132,
+       -120,  -112,  -104,   -96,   -88,   -80,   -72,   -64,
+        -56,   -48,   -40,   -32,   -24,   -16,    -8,     0,
+      32124, 31100, 30076, 29052, 28028, 27004, 25980, 24956,
+      23932, 22908, 21884, 20860, 19836, 18812, 17788, 16764,
+      15996, 15484, 14972, 14460, 13948, 13436, 12924, 12412,
+      11900, 11388, 10876, 10364,  9852,  9340,  8828,  8316,
+       7932,  7676,  7420,  7164,  6908,  6652,  6396,  6140,
+       5884,  5628,  5372,  5116,  4860,  4604,  4348,  4092,
+       3900,  3772,  3644,  3516,  3388,  3260,  3132,  3004,
+       2876,  2748,  2620,  2492,  2364,  2236,  2108,  1980,
+       1884,  1820,  1756,  1692,  1628,  1564,  1500,  1436,
+       1372,  1308,  1244,  1180,  1116,  1052,   988,   924,
+        876,   844,   812,   780,   748,   716,   684,   652,
+        620,   588,   556,   524,   492,   460,   428,   396,
+        372,   356,   340,   324,   308,   292,   276,   260,
+        244,   228,   212,   196,   180,   164,   148,   132,
+        120,   112,   104,    96,    88,    80,    72,    64,
+         56,    48,    40,    32,    24,    16,     8,     0
+};
+
+static const int16_t ALawDecompressTable[256] =
+{
+     -5504, -5248, -6016, -5760, -4480, -4224, -4992, -4736,
+     -7552, -7296, -8064, -7808, -6528, -6272, -7040, -6784,
+     -2752, -2624, -3008, -2880, -2240, -2112, -2496, -2368,
+     -3776, -3648, -4032, -3904, -3264, -3136, -3520, -3392,
+     -22016,-20992,-24064,-23040,-17920,-16896,-19968,-18944,
+     -30208,-29184,-32256,-31232,-26112,-25088,-28160,-27136,
+     -11008,-10496,-12032,-11520,-8960, -8448, -9984, -9472,
+     -15104,-14592,-16128,-15616,-13056,-12544,-14080,-13568,
+     -344,  -328,  -376,  -360,  -280,  -264,  -312,  -296,
+     -472,  -456,  -504,  -488,  -408,  -392,  -440,  -424,
+     -88,   -72,   -120,  -104,  -24,   -8,    -56,   -40,
+     -216,  -200,  -248,  -232,  -152,  -136,  -184,  -168,
+     -1376, -1312, -1504, -1440, -1120, -1056, -1248, -1184,
+     -1888, -1824, -2016, -1952, -1632, -1568, -1760, -1696,
+     -688,  -656,  -752,  -720,  -560,  -528,  -624,  -592,
+     -944,  -912,  -1008, -976,  -816,  -784,  -880,  -848,
+      5504,  5248,  6016,  5760,  4480,  4224,  4992,  4736,
+      7552,  7296,  8064,  7808,  6528,  6272,  7040,  6784,
+      2752,  2624,  3008,  2880,  2240,  2112,  2496,  2368,
+      3776,  3648,  4032,  3904,  3264,  3136,  3520,  3392,
+      22016, 20992, 24064, 23040, 17920, 16896, 19968, 18944,
+      30208, 29184, 32256, 31232, 26112, 25088, 28160, 27136,
+      11008, 10496, 12032, 11520, 8960,  8448,  9984,  9472,
+      15104, 14592, 16128, 15616, 13056, 12544, 14080, 13568,
+      344,   328,   376,   360,   280,   264,   312,   296,
+      472,   456,   504,   488,   408,   392,   440,   424,
+      88,    72,   120,   104,    24,     8,    56,    40,
+      216,   200,   248,   232,   152,   136,   184,   168,
+      1376,  1312,  1504,  1440,  1120,  1056,  1248,  1184,
+      1888,  1824,  2016,  1952,  1632,  1568,  1760,  1696,
+      688,   656,   752,   720,   560,   528,   624,   592,
+      944,   912,  1008,   976,   816,   784,   880,   848
+};
 
 /* reverse bits in a byte */
 static uint8_t byte_rev(uint8_t b)
@@ -278,6 +358,40 @@ static void cs4215_setmode(CS4215State *s, int mode)
     } else {
         s->freq = 0;
         s->status = CS4215_CLB_CLEAR(s->status);
+    }
+}
+
+static void cs4215_getformat(CS4215State *s, struct audsettings *as)
+{
+    as->freq = s->freq;
+    as->nchannels = (s->data_format & CS4215_ST) ? 2 : 1;
+    as->endianness = AUDIO_HOST_ENDIANNESS;
+
+    trace_dbri_codec_format(as->freq, as->nchannels,
+                            s->data_format & CS4215_DF_MASK);
+
+    s->tbl = NULL; /* conversion table */
+
+    switch (s->data_format & CS4215_DF_MASK) {
+
+    case CS4215_DF_S16:
+        as->fmt = AUD_FMT_S16;
+        as->endianness = 1;   /* big-endian */
+        break;
+
+    case CS4215_DF_ULAW:
+        s->tbl = MuLawDecompressTable;
+        as->fmt = AUD_FMT_S16;
+        break;
+
+    case CS4215_DF_ALAW:
+        s->tbl = ALawDecompressTable;
+        as->fmt = AUD_FMT_S16;
+        break;
+
+    case CS4215_DF_U8:
+        as->fmt = AUD_FMT_U8;
+        break;
     }
 }
 
@@ -425,6 +539,9 @@ static void dbri_next_txbuffer(DBRIState *s, unsigned int pipe)
     }
     /* get data pointer, re-use pipe data field */
     s->pipe[pipe].data = dbri_dma_read32(s, td_ptr+4);
+    s->play.offset = 0;
+
+    trace_dbri_audio_play(s->pipe[pipe].data, DBRI_TXBUF_LEN(s));
 }
 
 static void dbri_next_rxbuffer(DBRIState *s, unsigned int pipe)
@@ -438,6 +555,218 @@ static void dbri_next_rxbuffer(DBRIState *s, unsigned int pipe)
     }
     /* get data pointer, re-use pipe data field */
     s->pipe[pipe].data = dbri_dma_read32(s, rd_ptr+4);
+    s->rec.offset = 0;
+
+    trace_dbri_audio_record(s->pipe[pipe].data, DBRI_RXBUF_LEN(s));
+}
+
+static void dbri_out_cb(void *opaque, int free)
+{
+    DBRIState *s = opaque;
+    unsigned int pipe;
+    int left, used;
+    int len, buf_len;
+    uint32_t buf_ptr;
+    uint8_t tmpbuf[1024];
+    int16_t linbuf[1024];
+
+    pipe = s->play.pipe;
+    if (!pipe || s->play.stopped) {
+        AUD_set_active_out(s->voice_out, 0);
+        return;
+    }
+
+    used = 0;
+    while (free) {
+        buf_len = DBRI_TXBUF_LEN(s);
+        left = buf_len - s->play.offset;
+
+        /* end of buffer? */
+        if (left <= 0) {
+            uint32_t td_ptr = s->pipe[pipe].ptr;
+
+            if (!td_ptr) {
+                /* bad descriptor pointer - flag a fault? */
+                s->play.stopped = true;
+                break;
+            }
+
+            if (s->pipe[pipe].data) {
+                /* clear our data pointer to flag buffer done */
+                s->pipe[pipe].data = 0;
+
+                /* update status */
+                dbri_dma_write32(s, td_ptr+12, DBRI_TD_TBC);
+                if ((s->play.ctrl & DBRI_TD_EOF_INT) == DBRI_TD_EOF_INT) {
+                    /* transmit complete */
+                    dbri_post_interrupt(s, pipe, INTR_XCMP, 0);
+                }
+            }
+            /* next descriptor */
+            td_ptr = dbri_dma_read32(s, td_ptr+8);
+            if (!td_ptr) {
+                if (used) {
+                    /*
+                     * maybe the host buffers are too big,
+                     * give the guest a chance to catch up
+                     */
+                    break;
+                }
+                if (s->pipe[pipe].setup & SDP_EOL) {
+                    /* end of list */
+                    dbri_post_interrupt(s, pipe, INTR_EOL, td_ptr);
+                }
+                s->play.stopped = true;
+                break;
+            }
+            s->pipe[pipe].ptr = td_ptr;
+
+            dbri_next_txbuffer(s, pipe);
+
+            left = buf_len = DBRI_TXBUF_LEN(s);
+        }
+
+        if (!s->pipe[pipe].data) {
+            /* bad data pointer - flag a fault? */
+            s->play.stopped = true;
+            break;
+        }
+        buf_ptr = s->pipe[pipe].data + s->play.offset;
+        len = audio_MIN(left, sizeof(tmpbuf));
+
+        if (s->codec.tbl) {
+            /* convert from A/Mu-Law to 16-bit linear */
+            const int16_t *tbl;
+            int i;
+
+            len = audio_MIN(len, free >> 1);
+
+            sparc_iommu_memory_read(s->iommu, buf_ptr, tmpbuf, len);
+
+            tbl = s->codec.tbl;
+            for (i = 0; i < len; i++) {
+                linbuf[i] = tbl[tmpbuf[i]];
+            }
+            len = AUD_write(s->voice_out, linbuf, len << 1);
+            len >>= 1;
+        } else {
+            len = audio_MIN(len, free);
+
+            sparc_iommu_memory_read(s->iommu, buf_ptr, tmpbuf, len);
+
+            len = AUD_write(s->voice_out, tmpbuf, len);
+        }
+
+        if (len <= 0) {
+            break;
+        }
+
+        s->play.offset += len;
+        free -= len;
+        used += len;
+    }
+}
+
+static void dbri_in_cb(void *opaque, int avail)
+{
+    DBRIState *s = opaque;
+    unsigned int pipe;
+    int left, used;
+    int len, buf_len;
+    uint32_t status;
+
+    pipe = s->rec.pipe;
+    if (!pipe || s->rec.stopped) {
+        return;
+    }
+
+    used = 0;
+    while (avail) {
+        buf_len = DBRI_RXBUF_LEN(s);
+        left = buf_len - s->rec.offset;
+
+        /* end of buffer? */
+        if (left <= 0) {
+            uint32_t rd_ptr = s->pipe[pipe].ptr;
+
+            if (!rd_ptr) {
+                /* bad descriptor pointer - flag a fault? */
+                s->rec.stopped = true;
+                break;
+            }
+
+            if (s->pipe[pipe].data) {
+                /* clear our data pointer to flag buffer done */
+                s->pipe[pipe].data = 0;
+
+                /* update status - completed and EOF */
+                status = DBRI_RD_EOF | DBRI_RD_COM | (buf_len << 16);
+                dbri_dma_write32(s, rd_ptr, status);
+                if (s->rec.ctrl & DBRI_RD_FINT) {
+                    /* buffer ready */
+                    dbri_post_interrupt(s, pipe, INTR_BRDY, rd_ptr);
+                }
+            }
+            /* next descriptor */
+            rd_ptr = dbri_dma_read32(s, rd_ptr+8);
+            if (!rd_ptr) {
+                if (used) {
+                    /*
+                     * maybe the host buffers are too big,
+                     * give the guest a chance to catch up
+                     */
+                    break;
+                }
+                if (s->pipe[pipe].setup & SDP_EOL) {
+                    /* end of list */
+                    dbri_post_interrupt(s, pipe, INTR_EOL, rd_ptr);
+                }
+                s->rec.stopped = true;
+                break;
+            }
+            s->pipe[pipe].ptr = rd_ptr;
+
+            dbri_next_rxbuffer(s, pipe);
+
+            left = buf_len = DBRI_RXBUF_LEN(s);
+        }
+
+        if (!s->pipe[pipe].data) {
+            /* bad data pointer - flag a fault? */
+            s->rec.stopped = true;
+            break;
+        }
+        len = audio_MIN(left, avail);
+        /* TODO: record and store audio data */
+
+        if (len <= 0) {
+            break;
+        }
+
+        s->rec.offset += len;
+        avail -= len;
+        used += len;
+    }
+}
+
+static void dbri_update_audio(DBRIState *s)
+{
+    struct audsettings as;
+
+    cs4215_getformat(&s->codec, &as);
+    s->voice_out = AUD_open_out(&s->card, s->voice_out,
+                                "dbri_out", s, dbri_out_cb, &as);
+
+    /* zero is not a valid pipe */
+    if (s->play.pipe && !s->play.stopped) {
+        AUD_set_active_out(s->voice_out, 1);
+    } else {
+        AUD_set_active_out(s->voice_out, 0);
+    }
+    if (s->rec.pipe && !s->rec.stopped) {
+        /* TODO: audio record, this is just a placeholder */
+        dbri_in_cb(s, 0);
+    }
 }
 
 static void dbri_start_audio_out(DBRIState *s, unsigned int pipe)
@@ -450,6 +779,8 @@ static void dbri_start_audio_out(DBRIState *s, unsigned int pipe)
 
     s->play.pipe = pipe;
     s->play.stopped = false;
+
+    dbri_update_audio(s);
 }
 
 static void dbri_start_audio_in(DBRIState *s, unsigned int pipe)
@@ -462,6 +793,8 @@ static void dbri_start_audio_in(DBRIState *s, unsigned int pipe)
 
     s->rec.pipe = pipe;
     s->rec.stopped = false;
+
+    dbri_update_audio(s);
 }
 
 static void dbri_stop_audio(DBRIState *s, unsigned int pipe, int abort)
@@ -469,6 +802,7 @@ static void dbri_stop_audio(DBRIState *s, unsigned int pipe, int abort)
     if (pipe == s->play.pipe) {
         if (abort && s->pipe[pipe].ptr) {
             dbri_dma_write32(s, s->pipe[pipe].ptr+12, DBRI_TD_ABORT);
+            AUD_set_active_out(s->voice_out, 0);
         }
         s->play.stopped = true;
         s->play.pipe = 0;
@@ -636,6 +970,7 @@ static void dbri_cmd_cdp(DBRIState *s, uint32_t *cmd)
     if (i == s->rec.pipe) {
         s->rec.stopped = false;
     }
+    dbri_update_audio(s);
 }
 
 /* define time slot */
@@ -788,6 +1123,7 @@ static void dbri_reset(DeviceState *dev)
     DBRIState *s = container_of(dev, DBRIState, busdev.qdev);
     unsigned int i;
 
+    AUD_set_active_out(s->voice_out, 0);
     qemu_irq_lower(s->irq);
 
     /* set defaults */
@@ -910,6 +1246,9 @@ static int vmstate_dbri_post_load(void *opaque, int version_id)
         qemu_irq_raise(s->irq);
     }
 
+    /* resume playback */
+    dbri_update_audio(s);
+
     return 0;
 }
 
@@ -970,6 +1309,8 @@ static int dbri_init1(SysBusDevice *dev)
     memory_region_add_subregion(&s->container, DBRI_REG_OFFSET, &s->mem_io);
     sysbus_init_mmio(dev, &s->container);
     sysbus_init_irq(dev, &s->irq);
+
+    AUD_register_card("sun_dbri", &s->card);
 
     return 0;
 }

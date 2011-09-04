@@ -137,6 +137,9 @@ dbri_codec_read_data(int slot, uint8_t data) "slot %d: 0x%02x"
 dbri_codec_read_control(int slot, uint8_t data) "slot %d: 0x%02x"
 dbri_codec_write_data(int slot, uint8_t data) "slot %d: 0x%02x"
 dbri_codec_write_control(int slot, uint8_t data) "slot %d: 0x%02x"
+dbri_codec_format(int freq, int chan, int fmt) "audio format: %d Hz, %d chan, fmt %d"
+dbri_audio_play(uint32_t buffer, int len) "buffer @ 0x%08x, len %d"
+dbri_audio_record(uint32_t buffer, int len) "buffer @ 0x%08x, len %d"
 
 # hw/ds1225y.c
 nvram_read(uint32_t addr, uint32_t ret) "read addr %d: 0x%02x"
