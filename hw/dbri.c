@@ -1291,14 +1291,14 @@ static int dbri_init1(SysBusDevice *dev)
     uint32_t size = DBRI_REG_OFFSET + DBRI_REG_SIZE;
     void *rom_ptr;
 
-    memory_region_init_ram(&s->mem_rom, "dbri.rom", DBRI_ROM_SIZE);
+    memory_region_init_ram(&s->mem_rom, "dbri.rom", 0x1000);//DBRI_ROM_SIZE);
     memory_region_set_readonly(&s->mem_rom, true);
     rom_ptr = memory_region_get_ram_ptr(&s->mem_rom);
     memcpy(rom_ptr, dbri_rom, DBRI_ROM_SIZE);
 
     /* the SS-20 bootrom looks for the rom at 0x1000 instead of 0 */
     memory_region_init_alias(&s->mem_rom_alias, "dbri.rom-alias",
-                             &s->mem_rom, 0, DBRI_ROM_SIZE);
+                             &s->mem_rom, 0, 0x1000);//DBRI_ROM_SIZE);
     memory_region_set_readonly(&s->mem_rom_alias, true);
     memory_region_init_io(&s->mem_io, &dbri_ops, s, "dbri.regs",
                           DBRI_REG_SIZE);
