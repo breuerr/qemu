@@ -252,6 +252,9 @@ static void dma_reset(DeviceState *d)
 
     memset(s->dmaregs, 0, DMA_SIZE);
     s->dmaregs[0] = DMA_VER;
+    if (s->is_ledma) {
+        s->dmaregs[3] = 0xff000000;
+    }
 }
 
 static const VMStateDescription vmstate_dma = {
