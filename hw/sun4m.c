@@ -893,6 +893,16 @@ static void sun4m_hw_init(const struct sun4m_hwdef *hwdef, ram_addr_t RAM_size,
         exit (1);
     }
     num_vsimms = 0;
+    if (1) {
+        DeviceState *dev;
+        SysBusDevice *s;
+
+        dev = qdev_create(NULL, "SUNW,cg3");
+        qdev_init_nofail(dev);
+        s = sysbus_from_qdev(dev);
+        sysbus_mmio_map(s, 0, hwdef->tcx_base);
+        sysbus_connect_irq(s, 0, slavio_irq[11]); // sbus irq5
+    } else
     if (num_vsimms == 0) {
         tcx_init(hwdef->tcx_base, 0x00100000, graphic_width, graphic_height,
                  graphic_depth);
